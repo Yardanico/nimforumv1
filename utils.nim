@@ -1,6 +1,6 @@
 import asyncdispatch, smtp, strutils, json, os, rst, rstgen, xmltree, strtabs,
   htmlparser, streams, parseutils
-from times import getTime, getGMTime, format
+from times import getTime, utc, format
 
 proc parseInt*(s: string, value: var int, validRange: Slice[int]) {.
   noSideEffect.} =
@@ -37,7 +37,7 @@ proc loadConfig*(filename = getCurrentDir() / "forum.json"): Config =
   try:
     let root = parseFile(filename)
     result.smtpAddress = root{"smtpAddress"}.getStr("")
-    result.smtpPort = root{"smtpPort"}.getNum(25).int
+    result.smtpPort = root{"smtpPort"}.getInt(25)
     result.smtpUser = root{"smtpUser"}.getStr("")
     result.smtpPassword = root{"smtpPassword"}.getStr("")
     result.mlistAddress = root{"mlistAddress"}.getStr("")
@@ -88,7 +88,7 @@ proc rstToHtml*(content: string): string =
             let (nesting, contentNode, tag) = processGT(n, "p")
             if nesting > 0:
               var bq = currentBlockquote
-              for i in 1 .. <nesting:
+              for i in 1..<nesting:
                 var newBq = bq.child("blockquote")
                 if newBq.isNil:
                   newBq = newElement("blockquote")
@@ -138,7 +138,7 @@ proc sendMailToMailingList*(config: Config, username, user_email_addr, subject, 
 
   let from_addr = "$# <$#>" % [username, user_email_addr]
 
-  let date = getTime().getGMTime().format("ddd, d MMM yyyy HH:mm:ss") & " +0000"
+  let date = getTime().utc().format("ddd, d MMM yyyy HH:mm:ss") & " +0000"
   var otherHeaders = @[
     ("Date", date),
     ("Resent-From", "forum@nim-lang.org"),

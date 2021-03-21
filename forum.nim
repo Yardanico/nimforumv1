@@ -8,7 +8,7 @@
 
 import
   os, strutils, times, md5, strtabs, cgi, math, db_sqlite,
-  scgi, jester, asyncdispatch, asyncnet, cache, sequtils,
+  cgi, jester, asyncdispatch, asyncnet, cache, sequtils,
   parseutils, utils, random, rst, ranks, recaptcha
 
 when not defined(windows):
@@ -170,8 +170,8 @@ proc genButtons(c: TForumData, btns: seq[TStyledButton]): string =
       result.add(("""<a class="$3active button" href="$1$4">$2</a>""") % [
         btns[i].link, btns[i].text, class, anchor])
 
-proc toInterval(diff: int64): TimeInterval =
-  var remaining = diff
+proc toInterval(diff: Duration): TimeInterval =
+  var remaining = diff.inSeconds
   let years = remaining div 31536000
   remaining -= years * 31536000
   let months = remaining div 2592000
@@ -182,15 +182,15 @@ proc toInterval(diff: int64): TimeInterval =
   remaining -= hours * 3600
   let minutes = remaining div 60
   remaining -= minutes * 60
-  result = initInterval(0, remaining.int, minutes.int, hours.int, days.int,
+  result = initTimeInterval(0, remaining.int, minutes.int, hours.int, days.int,
                         months.int, years.int)
 
 proc formatTimestamp(t: int): string =
-  let t2 = Time(t)
+  let t2 = fromUnix(t)
   let now = getTime()
   let diff = (now - t2).toInterval()
   if diff.years > 0:
-    return getGMTime(t2).format("MMMM d',' yyyy")
+    return utc(t2).format("MMMM d',' yyyy")
   elif diff.months > 0:
     return $diff.months & (if diff.months > 1: " months ago" else: " month ago")
   elif diff.days > 0:
@@ -215,9 +215,9 @@ proc genGravatar(email: string, size: int = 80): string =
 proc randomSalt(): string =
   result = ""
   for i in 0..127:
-    var r = random(225)
+    var r = rand(225)
     if r >= 32 and r <= 126:
-      result.add(chr(random(225)))
+      result.add(chr(rand(225)))
 
 proc devRandomSalt(): string =
   when defined(posix):
@@ -236,15 +236,16 @@ proc makeSalt(): string =
   ## Creates a salt using a cryptographically secure random number generator.
   ##
   ## Ensures that the resulting salt contains no ``\0``.
+  var temp: cstring
   try:
-    result = devRandomSalt()
+    temp = cstring devRandomSalt()
   except IOError:
-    result = randomSalt()
+    temp = cstring randomSalt()
 
   var newResult = ""
-  for i in 0 .. <result.len:
-    if result[i] != '\0':
-      newResult.add result[i]
+  for i in 0 ..< temp.len:
+    if temp[i] != '\0':
+      newResult.add temp[i]
   return newResult
 
 proc makePassword(password, salt: string, comparingTo = ""): string =
@@ -270,7 +271,7 @@ proc makeIdentHash(user, password, epoch, secret: string,
     result = hash(user & password & epoch & secret, bcryptSalt)
 
 # -----------------------------------------------------------------------------
-template `||`(x: untyped): untyped = (if not isNil(x): x else: "")
+template `||`(x: untyped): untyped = x
 
 proc validThreadId(c: TForumData): bool =
   result = getValue(db, sql"select id from thread where id = ?",
@@ -337,7 +338,7 @@ proc register(c: TForumData, name, pass, antibot, userIp,
     sql("INSERT INTO person(name, password, email, salt, status, lastOnline) " &
         "VALUES (?, ?, ?, ?, ?, DATETIME('now'))"), name,
               password, email, salt,
-              when defined(dev): $Moderated else: $EmailUnconfirmed)
+              when defined(dev): $User else: $EmailUnconfirmed)
 
   return true
 
@@ -755,7 +756,7 @@ proc getStats(c: TForumData, simple: bool): TForumStats =
       sql"select id, name, strftime('%s', lastOnline), strftime('%s', creation) from person"
     for row in fastRows(db, getUsersQuery):
       let secs = if row[3] == "": 0 else: row[3].parseint
-      let lastOnlineSeconds = getTime() - Time(secs)
+      let lastOnlineSeconds = (getTime() - fromUnix(secs)).inSeconds
       if lastOnlineSeconds < (60 * 5): # 5 minutes
         result.activeUsers.add((row[1], row[0].parseInt))
       if row[3].parseInt > newestMemberCreation:
@@ -923,8 +924,8 @@ proc genProfile(c: TForumData, ui: TUserInfo): string =
     )
   )
   result.add(htmlgen.`div`(id = "avatar", genGravatar(ui.email, 250)))
-  let t2 = if ui.lastOnline != -1: getGMTime(Time(ui.lastOnline))
-           else: getGMTime(getTime())
+  let t2 = if ui.lastOnline != -1: utc(fromUnix(ui.lastOnline))
+           else: utc(getTime())
 
   result.add(htmlgen.`div`(id = "info",
     htmlgen.table(
@@ -989,8 +990,34 @@ template createTFD() =
   c.isThreadsList = false
   c.pageNum = 1
   c.config = config
-  if request.cookies.len > 0:
+  if cookies(request).len > 0:
     checkLoggedIn(c)
+
+
+when isMainModule:
+  randomize()
+  db = open(connection="nimforum.db", user="postgres", password="",
+              database="nimforum")
+  isFTSAvailable = db.getAllRows(sql("SELECT name FROM sqlite_master WHERE " &
+      "type='table' AND name='post_fts'")).len == 1
+  config = loadConfig()
+  if len(config.recaptchaSecretKey) > 0 and len(config.recaptchaSiteKey) > 0:
+    useCaptcha = true
+    captcha = initReCaptcha(config.recaptchaSecretKey, config.recaptchaSiteKey)
+  else:
+    useCaptcha = false
+  var http = true
+  if paramCount() > 0:
+    if paramStr(1) == "scgi":
+      http = false
+
+  #run("", port = TPort(9000), http = http)
+
+  #runForever()
+  #db.close()
+
+settings:
+  port = Port(5757)
 
 routes:
   get "/":
@@ -1035,9 +1062,9 @@ routes:
         let subject = getValue(db,
             sql"select header from post where id = (select max(id) from post where thread = ?)",
             $c.threadId).prependRe
-        body = genPostsList(c, $c.threadId, count)
+        result[3] = genPostsList(c, $c.threadId, count)
         cond count != 0
-        body.add genFormPost(c, "doreply", "Reply", subject, "", false)
+        result[3].add genFormPost(c, "doreply", "Reply", subject, "", false)
         title = "Replying to thread: " & pSubject
       of "edit":
         cond c.postId != -1
@@ -1045,10 +1072,10 @@ routes:
         let row = getRow(db, query, $c.postId)
         let header = ||row[0]
         let content = ||row[1]
-        body = genFormPost(c, "doedit", "Edit", header, content, true)
+        result[3] = genFormPost(c, "doedit", "Edit", header, content, true)
         title = "Editing post"
       else: discard
-      resp c.genMain(body, title & " - Nim Forum")
+      resp c.genMain(result[3], title & " - Nim Forum")
     else:
       incrementViews(c)
       let posts = genPostsList(c, $c.threadId, count)
@@ -1104,10 +1131,10 @@ routes:
 
   template handleError(action: string, topText: string, isEdit: bool) =
     if c.isPreview:
-      body.add genPostPreview(c, @"subject", @"content",
-                              c.userName, $getGMTime(getTime()))
-    body.add genFormPost(c, action, topText, reuseText, reuseText, isEdit)
-    resp genMain(c, body(), "Nim Forum - " &
+      result[3].add genPostPreview(c, @"subject", @"content",
+                              c.userName, $utc(getTime()))
+    result[3].add genFormPost(c, action, topText, reuseText, reuseText, isEdit)
+    resp genMain(c, result[3], "Nim Forum - " &
                             (if c.isPreview: "Preview" else: "Error"))
 
   post "/dologin":
@@ -1136,7 +1163,7 @@ routes:
     if newThread(c):
       redirect(uri("/"))
     else:
-      body = ""
+      result[3] = ""
       handleError("donewthread", "New thread", false)
 
   post "/doreply":
@@ -1148,7 +1175,7 @@ routes:
       var count = 0
       if c.isPreview:
         c.pageNum = c.getPagesInThread+1
-      body = genPostsList(c, $c.threadId, count)
+      result[3] = genPostsList(c, $c.threadId, count)
       handleError("doreply", "Reply", false)
 
   post "/doedit":
@@ -1158,7 +1185,7 @@ routes:
       redirect(c.genThreadUrl(postId = $c.postId,
                               pageNum = $(c.getPagesInThread+1)))
     else:
-      body = ""
+      result[3] = ""
       handleError("doedit", "Edit", true)
 
   get "/newthread/?":
@@ -1185,8 +1212,8 @@ routes:
     cond(@"nick" != "")
     if c.rank < Moderator:
       resp genMain(c, "You cannot delete this user's data.", "Error - Nim Forum")
-    let result = deleteAll(c, @"nick")
-    if result:
+    let res = deleteAll(c, @"nick")
+    if res:
       redirect(c.req.makeUri("/profile/" & @"nick"))
     else:
       resp genMain(c, "Failed to delete all user's posts and threads.",
@@ -1348,25 +1375,3 @@ routes:
     textPage "static/search-help"
   get "/rst":
     textPage "static/rst"
-
-when isMainModule:
-  randomize()
-  db = open(connection="nimforum.db", user="postgres", password="",
-              database="nimforum")
-  isFTSAvailable = db.getAllRows(sql("SELECT name FROM sqlite_master WHERE " &
-      "type='table' AND name='post_fts'")).len == 1
-  config = loadConfig()
-  if len(config.recaptchaSecretKey) > 0 and len(config.recaptchaSiteKey) > 0:
-    useCaptcha = true
-    captcha = initReCaptcha(config.recaptchaSecretKey, config.recaptchaSiteKey)
-  else:
-    useCaptcha = false
-  var http = true
-  if paramCount() > 0:
-    if paramStr(1) == "scgi":
-      http = false
-
-  #run("", port = TPort(9000), http = http)
-
-  runForever()
-  db.close()
